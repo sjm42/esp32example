@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>ESP32 example firmware</title>
+  <script src="./form.js"></script>
+  <link rel="stylesheet" href="./index.css">
+</head>
+
+<body>
+<main class="app">
+<section class="panel">
+<h1>ESP32 example firmware</h1>
+<p class="panel-intro">Minimal Rust + ESP-IDF starter with WiFi, web config, OTA, MQTT, AP-mode recovery and optional DS18B20 support.</p>
+<p>Firmware version {{ crate::FW_VERSION }}</p>
+<p>OTA slot {{ askama::get_value::<String>("ota_slot")? }}</p>
+<div id="uptime">Uptime: - - -</div>
+</section>
+
+<section class="panel">
+<h2>Settings</h2>
+{% let myform = [
+    ("text", "port", port.to_string(), "HTTP port"),
+    ("text", "wifi_ssid", wifi_ssid.to_string(), "WiFi SSID"),
+    ("checkbox", "wifi_wpa2ent", wifi_wpa2ent.to_string(), "WPA2 Enterprise"),
+    ("text", "wifi_username", wifi_username.to_string(), "WPA2 Enterprise username"),
+    ("password", "wifi_pass", wifi_pass.to_string(), "WiFi password"),
+    ("checkbox", "v4dhcp", v4dhcp.to_string(), "Use DHCP"),
+    ("text", "v4addr", v4addr.to_string(), "IPv4 address"),
+    ("text", "v4mask", v4mask.to_string(), "IPv4 mask length (0-30)"),
+    ("text", "v4gw", v4gw.to_string(), "IPv4 gateway"),
+    ("text", "dns1", dns1.to_string(), "DNS 1"),
+    ("text", "dns2", dns2.to_string(), "DNS 2"),
+    ("checkbox", "mqtt_enable", mqtt_enable.to_string(), "MQTT enabled"),
+    ("text", "mqtt_url", mqtt_url.to_string(), "MQTT URL"),
+    ("text", "mqtt_topic", mqtt_topic.to_string(), "MQTT topic prefix"),
+    ("checkbox", "sensor_enable", sensor_enable.to_string(), "DS18B20 polling enabled"),
+    ("text", "sensor_retries", sensor_retries.to_string(), "Sensor read retries"),
+    ("text", "sensor_poll_delay", sensor_poll_delay.to_string(), "Sensor poll interval (s)")
+] -%}
+<form action="/config" method="POST" name="esp32cfg">
+    <table>
+{%- for (itype, name, value, descr) in myform %}
+        <tr>
+{%- if *itype == "checkbox" %}
+            <th><label for="{{name}}">{{descr}}:</label></th>
+            <th><input name="{{name}}" type="{{itype}}"{% if value == "true" %} checked{% endif %}></th>
+{%- else %}
+            <th><label for="{{name}}">{{descr}}:</label></th>
+            <th><input name="{{name}}" type="{{itype}}" value="{{value}}"></th>
+{%- endif %}
+        </tr>
+{%- endfor %}
+    </table>
+    <input type="submit" value="Submit">
+</form>
+</section>
+
+<section class="panel">
+<h2>Example JSON Endpoint</h2>
+<p>Submit a sample message to <code>POST /sample</code>. The same state can also be updated over MQTT on <code>{{ mqtt_topic }}/cmd/sample</code>.</p>
+<form action="/sample" method="POST" name="examplemsg">
+  <label for="sample-message">Message:</label>
+  <input type="text" id="sample-message" name="message" value="hello from web api">
+  <input type="submit" value="Send sample">
+</form>
+</section>
+
+<section class="panel danger">
+<h2>OTA firmware update (DANGER)</h2>
+<form action="/fw" method="POST" name="esp32fw">
+  <label for="firmware">Firmware URL:</label>
+  <input type="text" id="firmware" name="url">
+  <input type="submit" value="Update!">
+</form>
+</section>
+
+<section class="panel">
+<h2>Device State</h2>
+<div id="device-state">- - -</div>
+</section>
+
+<section class="panel">
+<h2>Sample State</h2>
+<div id="sample-state">- - -</div>
+</section>
+
+<section class="panel">
+<h2>Detected sensors</h2>
+<div id="detected-sensors">- - -</div>
+</section>
+
+<section class="panel">
+<h2>Temperatures</h2>
+<div id="temperatures">- - -</div>
+</section>
+</main>
+</body>
+</html>

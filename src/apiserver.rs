@@ -1,0 +1,348 @@
+// apiserver.rs
+
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{Form, State},
+    http::{Response, StatusCode, header},
+    response::{Html, IntoResponse},
+    routing::*,
+};
+pub use axum_macros::debug_handler;
+use embedded_svc::http::client::Client as HttpClient;
+use esp_idf_svc::{
+    http::client::{Configuration as HttpConfiguration, EspHttpConnection},
+    io,
+    ota::EspOta,
+};
+
+use crate::*;
+
+macro_rules! static_handler {
+    ($fn_name:ident, $path:literal, $content_type:literal, $bytes:expr) => {
+        async fn $fn_name(State(state): State<Arc<Pin<Box<MyState>>>>) -> Response<Body> {
+            let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+            info!("#{cnt} {}", $path);
+
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, $content_type),
+                    (header::CONTENT_ENCODING, "gzip"),
+                ],
+                $bytes.to_vec(),
+            )
+                .into_response()
+        }
+    };
+}
+static_handler!(
+    get_favicon,
+    "/favicon.ico",
+    "image/vnd.microsoft.icon",
+    include_bytes!(concat!(env!("OUT_DIR"), "/favicon.ico.gz"))
+);
+static_handler!(
+    get_formjs,
+    "/form.js",
+    "text/javascript",
+    include_bytes!(concat!(env!("OUT_DIR"), "/form.js.gz"))
+);
+static_handler!(
+    get_indexcss,
+    "/index.css",
+    "text/css; charset=utf-8",
+    include_bytes!(concat!(env!("OUT_DIR"), "/index.css.gz"))
+);
+
+#[derive(Debug, Serialize)]
+pub struct DeviceStateResponse {
+    firmware: String,
+    ota_slot: String,
+    ap_mode: bool,
+    wifi_up: bool,
+    ntp_ok: bool,
+    ip_addr: String,
+    device_id: String,
+    mac_addr: String,
+    mqtt_enabled: bool,
+    sensor_count: usize,
+    sensor_enabled: bool,
+    sample: SampleState,
+}
+
+pub async fn run_api_server(state: Arc<Pin<Box<MyState>>>) -> anyhow::Result<()> {
+    loop {
+        if *state.wifi_up.read().await {
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    let listen = format!("0.0.0.0:{}", state.config.port);
+    let addr = listen.parse::<net::SocketAddr>()?;
+
+    let app = Router::new()
+        .route("/", get(get_index))
+        .route("/favicon.ico", get(get_favicon))
+        .route("/form.js", get(get_formjs))
+        .route("/index.css", get(get_indexcss))
+        .route("/state", get(get_state))
+        .route(
+            "/sample",
+            get(get_sample).post(post_sample).options(options),
+        )
+        .route("/uptime", get(get_uptime))
+        .route("/sensors", get(get_sensors))
+        .route("/temp", get(get_temp))
+        .route(
+            "/config",
+            get(get_config).post(post_config).options(options),
+        )
+        .route("/reset_config", get(reset_config))
+        .route("/fw", post(update_fw).options(options))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("API server listening to {listen}");
+    Ok(axum::serve(listener, app.into_make_service()).await?)
+}
+
+pub async fn options(State(state): State<Arc<Pin<Box<MyState>>>>) -> Response<Body> {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} options()");
+
+    (
+        StatusCode::OK,
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "get,post"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
+        ],
+    )
+        .into_response()
+}
+
+pub async fn get_index(State(state): State<Arc<Pin<Box<MyState>>>>) -> Response<Body> {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_index()");
+
+    let value_tuple: (&str, &dyn Any) = ("ota_slot", &state.ota_slot.clone());
+    let index = match state.config.clone().render_with_values(&value_tuple) {
+        Err(e) => {
+            let err_msg = format!("Index template error: {e:?}\n");
+            error!("{err_msg}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, err_msg).into_response();
+        }
+        Ok(s) => s,
+    };
+    (StatusCode::OK, Html(index)).into_response()
+}
+
+pub async fn get_uptime(State(state): State<Arc<Pin<Box<MyState>>>>) -> (StatusCode, Json<Uptime>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_uptime()");
+
+    let uptime = Uptime {
+        uptime: state.data.read().await.uptime,
+        uptime_s: state.data.read().await.uptime_s.clone(),
+    };
+    (StatusCode::OK, Json(uptime))
+}
+
+pub async fn get_state(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+) -> (StatusCode, Json<DeviceStateResponse>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_state()");
+
+    let sample = state.sample.read().await.clone();
+    let sensor_count = {
+        let sensors = state.sensors.read().await;
+        sensors.iter().map(|s| s.ids.len()).sum()
+    };
+    let resp = DeviceStateResponse {
+        firmware: FW_VERSION.into(),
+        ota_slot: state.ota_slot.clone(),
+        ap_mode: state.ap_mode,
+        wifi_up: *state.wifi_up.read().await,
+        ntp_ok: *state.ntp_ok.read().await,
+        ip_addr: state.ip_addr.read().await.to_string(),
+        device_id: state.myid.read().await.clone(),
+        mac_addr: state.my_mac_s.read().await.clone(),
+        mqtt_enabled: state.config.mqtt_enable,
+        sensor_count,
+        sensor_enabled: state.config.sensor_enable,
+        sample,
+    };
+
+    (StatusCode::OK, Json(resp))
+}
+
+pub async fn get_sample(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+) -> (StatusCode, Json<SampleState>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_sample()");
+
+    (StatusCode::OK, Json(state.sample.read().await.clone()))
+}
+
+pub async fn post_sample(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+    Json(sample): Json<SampleMessage>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} post_sample()");
+
+    state.update_sample_message("http", sample.message).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "message": "Sample state updated" })),
+    )
+}
+
+pub async fn get_sensors(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+) -> (StatusCode, Json<SensorValues>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_sensors()");
+
+    let sensors = {
+        let onewires = state.sensors.read().await;
+        let sensors = onewires
+            .iter()
+            .flat_map(|onew| {
+                onew.ids.iter().map(|id| Sensor {
+                    iopin: onew.name.clone(),
+                    sensor: format_device_id(id),
+                })
+            })
+            .collect::<Vec<Sensor>>();
+        SensorValues { sensors }
+    };
+
+    (StatusCode::OK, Json(sensors))
+}
+
+pub async fn get_temp(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+) -> (StatusCode, Json<TempValues>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_temp()");
+
+    let ret = {
+        let data = state.data.read().await;
+        TempValues {
+            timestamp: data.timestamp,
+            last_update: data.last_update.clone(),
+            uptime: data.uptime,
+            uptime_s: data.uptime_s.clone(),
+            temperatures: data
+                .temperatures
+                .iter()
+                .filter(|v| v.value > NO_TEMP)
+                .cloned()
+                .collect::<Vec<TempData>>(),
+        }
+    };
+    (StatusCode::OK, Json(ret))
+}
+
+pub async fn get_config(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+) -> (StatusCode, Json<MyConfig>) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} get_conf()");
+    (StatusCode::OK, Json(state.config.clone()))
+}
+
+pub async fn post_config(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+    Json(mut config): Json<MyConfig>,
+) -> (StatusCode, String) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} set_conf()");
+
+    if config.port == 0 {
+        let msg = "HTTP port must be greater than zero";
+        error!("{msg}");
+        return (StatusCode::BAD_REQUEST, msg.to_string());
+    }
+
+    if config.v4mask > 30 {
+        let msg = "IPv4 mask error: bits must be between 0..30";
+        error!("{msg}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, msg.to_string());
+    }
+
+    if config.v4dhcp {
+        config.v4addr = net::Ipv4Addr::new(0, 0, 0, 0);
+        config.v4mask = 0;
+        config.v4gw = net::Ipv4Addr::new(0, 0, 0, 0);
+        config.dns1 = net::Ipv4Addr::new(0, 0, 0, 0);
+        config.dns2 = net::Ipv4Addr::new(0, 0, 0, 0);
+    }
+
+    info!("Saving new config to nvs...");
+    Box::pin(save_conf(state, config)).await
+}
+
+pub async fn reset_config(State(state): State<Arc<Pin<Box<MyState>>>>) -> (StatusCode, String) {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} reset_conf()");
+
+    info!("Saving default config to nvs...");
+    Box::pin(save_conf(state, MyConfig::default())).await
+}
+
+async fn save_conf(state: Arc<Pin<Box<MyState>>>, config: MyConfig) -> (StatusCode, String) {
+    let mut nvs = state.nvs.write().await;
+    match config.to_nvs(&mut nvs) {
+        Ok(_) => {
+            info!("Config saved to nvs. Resetting soon...");
+            *state.reset.write().await = true;
+            (StatusCode::OK, "OK".to_string())
+        }
+        Err(e) => {
+            let msg = format!("Nvs write error: {e:?}");
+            error!("{msg}");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        }
+    }
+}
+
+async fn update_fw(
+    State(state): State<Arc<Pin<Box<MyState>>>>,
+    Form(fw_update): Form<UpdateFirmware>,
+) -> Response<Body> {
+    let cnt = state.api_cnt.fetch_add(1, Ordering::Relaxed);
+    info!("#{cnt} update_fw()");
+
+    info!("Firmware update: \n{fw_update:#?}");
+    if !fw_update.url.starts_with("http://") && !fw_update.url.starts_with("https://") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let client_config = HttpConfiguration {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+
+    let mut ota = EspOta::new().unwrap();
+    let mut client = HttpClient::wrap(EspHttpConnection::new(&client_config).unwrap());
+    let req = client.get(fw_update.url.as_str()).unwrap();
+    let resp = req.submit().unwrap();
+    if resp.status() != StatusCode::OK {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut update = ota.initiate_update().unwrap();
+    let mut buffer = [0_u8; 8192];
+    io::utils::copy(resp, &mut update, &mut buffer).unwrap();
+    info!("Update done. Restarting...");
+    update.complete().unwrap();
+    esp_idf_svc::hal::reset::restart();
+}
+
+// EOF
