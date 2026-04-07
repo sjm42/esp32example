@@ -1,0 +1,61 @@
+[package]
+name = "esp32example"
+version = "0.1.0"
+authors = ["Sami J. Mäkinen <sjm@iki.fi>"]
+edition = "2024"
+resolver = "2"
+
+[[bin]]
+name = "esp32example"
+harness = false
+
+[features]
+default = ["esp32-c3"]
+reset_settings = []
+esp32-c3 = []
+esp-wroom-32 = []
+display-max7219 = ["dep:max7219", "dep:bit_reverse", "dep:encoding_rs"]
+display-ws2812 = ["dep:bit_reverse", "dep:encoding_rs"]
+
+[dependencies]
+anyhow = "1.0"
+askama = "0.15"
+axum = { version = "0.8", features = ["http1", "json", "form"] }
+axum-macros = "0.5"
+bit_reverse = { version = "0.1", optional = true }
+chrono = "0.4"
+crc = "3.4"
+embedded-hal = "1.0"
+embedded-svc = { version = "0.29", features = ["experimental"] }
+encoding_rs = { version = "0.8", optional = true }
+esp-idf-hal = "0.46"
+esp-idf-sys = { version = "0.37", features = ["binstart"] }
+esp-idf-svc = { version = "0.52", features = ["alloc", "experimental"] }
+humantime = "2.3"
+max7219 = { version = "0.5", optional = true }
+postcard = { version = "1.1", features = ["alloc", "use-crc"] }
+serde = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.51", features = ["rt", "net", "io-util"] }
+tracing = "0.1"
+
+[build-dependencies]
+build-data = "0.3"
+embuild = "0.33"
+anyhow = "1.0"
+flate2 = "1.1"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "onewire_bus", version = "^1.0.4" }
+
+[profile.release]
+debug = false
+opt-level = "z"
+codegen-units = 1
+lto = "fat"
+strip = true
+
+[profile.dev]
+debug = true
+opt-level = 2
+lto = "off"
